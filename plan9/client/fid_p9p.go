@@ -245,6 +245,11 @@ func (fid *Fid) Walk(name string) (*Fid, error) {
 		if err != nil {
 			if wfid != nil {
 				wfid.Close()
+			} else {
+				// wfidnum was allocated but no Fid struct was created for it yet.
+				// Wrap it so Close() sends Tclunk, recycling the number via
+				// clunked() even if the server returns Rerror ("unknown fid").
+				conn.newFid(wfidnum, plan9.Qid{}).Close()
 			}
 			return nil, err
 		}

@@ -38,8 +38,11 @@ type Win struct {
 	data       *client.Fid
 	xdata      *client.Fid
 	errors     *client.Fid
+	log        *client.Fid
 	ebuf       *bufio.Reader
+	elbuf      *bufio.Reader
 	c          chan *Event
+	elc        chan *WinLogEvent
 	next, prev *Win
 	buf        []byte
 	e2, e3, e4 Event
@@ -270,6 +273,82 @@ func (w *Win) Addr(format string, args ...interface{}) error {
 	return w.Fprintf("addr", format, args...)
 }
 
+// Style writes data to the window's style file and closes it, triggering
+// an atomic style flush in acme.  A nil or empty data clears all styles.
+// Unlike other file accessors, a fresh fid is opened on each call because
+// acme flushes the style only at close (clunk).
+func (w *Win) Style(data []byte) error {
+	fsysOnce.Do(mountAcme)
+	if fsysErr != nil {
+		return fsysErr
+	}
+	fid, err := fsys.Open(fmt.Sprintf("%d/style", w.id), plan9.OWRITE)
+	if err != nil {
+		return err
+	}
+	defer fid.Close()
+	if len(data) == 0 {
+		return nil
+	}
+	_, err = fid.Write(data)
+	return err
+}
+
+// A WinLogEvent is a single body-edit event read from a window's log file.
+// Op is 'I' (insert) or 'D' (delete).
+// For inserts, Q0 is the rune position and Q1 is the number of runes inserted.
+// For deletes, Q0 and Q1 are the start and end of the deleted range.
+type WinLogEvent struct {
+	Op     byte
+	Q0, Q1 int
+}
+
+// ReadLog reads the next edit event from the window's per-window log file.
+func (w *Win) ReadLog() (*WinLogEvent, error) {
+	if _, err := w.fid("log"); err != nil {
+		return nil, err
+	}
+	if w.elbuf == nil {
+		w.elbuf = bufio.NewReader(w.log)
+	}
+	line, err := w.elbuf.ReadString('\n')
+	if err != nil {
+		return nil, err
+	}
+	line = strings.TrimSuffix(line, "\n")
+	if len(line) < 5 {
+		return nil, fmt.Errorf("short log line: %q", line)
+	}
+	e := &WinLogEvent{Op: line[0]}
+	if _, err := fmt.Sscanf(line[2:], "%d %d", &e.Q0, &e.Q1); err != nil {
+		return nil, fmt.Errorf("bad log line: %q", line)
+	}
+	return e, nil
+}
+
+// LogChan returns a channel on which per-window body-edit events are
+// delivered.  The first call starts a goroutine; subsequent calls return
+// the same channel.  The channel is closed when the log file returns an
+// error (typically because the window was deleted).
+func (w *Win) LogChan() <-chan *WinLogEvent {
+	if w.elc == nil {
+		w.elc = make(chan *WinLogEvent)
+		go w.editLogReader()
+	}
+	return w.elc
+}
+
+func (w *Win) editLogReader() {
+	for {
+		e, err := w.ReadLog()
+		if err != nil {
+			break
+		}
+		w.elc <- e
+	}
+	close(w.elc)
+}
+
 // CloseFiles closes all the open files associated with the window w.
 // (These file descriptors are cached across calls to Ctl, etc.)
 func (w *Win) CloseFiles() {
@@ -297,6 +376,12 @@ func (w *Win) CloseFiles() {
 
 	w.errors.Close()
 	w.errors = nil
+
+	if w.log != nil {
+		w.log.Close()
+		w.log = nil
+	}
+	w.elbuf = nil
 }
 
 // Ctl writes the command format, ... to the window's ctl file.
@@ -346,6 +431,9 @@ func (w *Win) fid(name string) (*client.Fid, error) {
 	case "errors":
 		f = &w.errors
 		mode = plan9.OWRITE
+	case "log":
+		f = &w.log
+		mode = plan9.OREAD
 	default:
 		return nil, errors.New("unknown acme file: " + name)
 	}

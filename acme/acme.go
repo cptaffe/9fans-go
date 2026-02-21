@@ -311,6 +311,18 @@ func (w *Win) Addr(format string, args ...interface{}) error {
 	return w.Fprintf("addr", format, args...)
 }
 
+// ReadBody reads the complete body of the window.
+// A fresh fid is opened on each call so reading always starts at offset zero,
+// regardless of how much was read by any previous call.
+func (w *Win) ReadBody() ([]byte, error) {
+	fid, err := w.fs.Open(fmt.Sprintf("%d/body", w.id), plan9.OREAD)
+	if err != nil {
+		return nil, err
+	}
+	defer fid.Close()
+	return io.ReadAll(fid)
+}
+
 // Style writes data to the window's style file and closes it, triggering
 // an atomic style flush in acme.  A nil or empty data clears all styles.
 // Unlike other file accessors, a fresh fid is opened on each call because

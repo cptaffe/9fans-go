@@ -27,8 +27,116 @@ import (
 	"9fans.net/go/plan9/client"
 )
 
+// Fsys is a connection to a running acme instance.
+// Obtain one with Mount; simple tools use the package-level functions
+// which delegate to an internal default Fsys initialised via sync.Once.
+type Fsys struct {
+	fs *client.Fsys
+}
+
+// New creates a new acme window on this connection.
+func (f *Fsys) New() (*Win, error) {
+	fid, err := f.fs.Open("new/ctl", plan9.ORDWR)
+	if err != nil {
+		return nil, err
+	}
+	buf := make([]byte, 100)
+	n, err := fid.Read(buf)
+	if err != nil {
+		fid.Close()
+		return nil, err
+	}
+	a := strings.Fields(string(buf[0:n]))
+	if len(a) == 0 {
+		fid.Close()
+		return nil, errors.New("short read from acme/new/ctl")
+	}
+	id, err := strconv.Atoi(a[0])
+	if err != nil {
+		fid.Close()
+		return nil, errors.New("invalid window id in acme/new/ctl: " + a[0])
+	}
+	return f.Open(id, fid)
+}
+
+// Open connects to the existing window with the given id on this connection.
+// If ctl is non-nil it is used as the window's control file (ownership transferred).
+func (f *Fsys) Open(id int, ctl *client.Fid) (*Win, error) {
+	if ctl == nil {
+		var err error
+		ctl, err = f.fs.Open(fmt.Sprintf("%d/ctl", id), plan9.ORDWR)
+		if err != nil {
+			return nil, err
+		}
+	}
+	w := new(Win)
+	w.fs = f.fs
+	w.id = id
+	w.ctl = ctl
+	windowsMu.Lock()
+	w.prev = last
+	if last != nil {
+		last.next = w
+	} else {
+		windows = w
+	}
+	last = w
+	windowsMu.Unlock()
+	return w, nil
+}
+
+// Windows returns a list of the existing acme windows on this connection.
+func (f *Fsys) Windows() ([]WinInfo, error) {
+	index, err := f.fs.Open("index", plan9.OREAD)
+	if err != nil {
+		return nil, err
+	}
+	defer index.Close()
+	data, err := ioutil.ReadAll(index)
+	if err != nil {
+		return nil, err
+	}
+	var infos []WinInfo
+	for _, line := range strings.Split(string(data), "\n") {
+		if len(line) == 0 {
+			continue
+		}
+		var info WinInfo
+		tag, err := splitFields(line,
+			&info.ID,
+			&info.TagLen,
+			&info.BodyLen,
+			&info.IsDir,
+			&info.IsModified,
+		)
+		if err != nil {
+			log.Printf("acme: skipping malformed index line %q: %v", line, err)
+			continue
+		}
+		i := strings.Index(tag, " Del Snarf ")
+		if i == -1 {
+			log.Printf("acme: cannot find filename in tag %q, skipping", tag)
+			continue
+		}
+		info.Name = tag[:i]
+		info.Tag = tag[i:]
+		infos = append(infos, info)
+	}
+	return infos, nil
+}
+
+// Log returns a reader for the acme log file on this connection.
+func (f *Fsys) Log() (*LogReader, error) {
+	fid, err := f.fs.Open("log", plan9.OREAD)
+	if err != nil {
+		return nil, err
+	}
+	return &LogReader{f: fid}, nil
+}
+
 // A Win represents a single acme window and its control files.
 type Win struct {
+	fs         *client.Fsys
 	id         int
 	ctl        *client.Fid
 	tag        *client.Fid
@@ -55,9 +163,16 @@ var windowsMu sync.Mutex
 var windows, last *Win
 var autoExit bool
 
-var fsys *client.Fsys
-var fsysErr error
-var fsysOnce sync.Once
+var defaultFsys *Fsys
+var defaultErr error
+var defaultOnce sync.Once
+
+// defaultFS returns the lazily-initialised default Fsys, calling
+// mountAcme exactly once.  Mirrors the upstream fsysOnce.Do(mountAcme) pattern.
+func defaultFS() (*Fsys, error) {
+	defaultOnce.Do(mountAcme)
+	return defaultFsys, defaultErr
+}
 
 // AutoExit sets whether to call os.Exit the next time the last managed acme window is deleted.
 // If there are no acme windows at the time of the call, the exit does not happen until one
@@ -68,33 +183,13 @@ func AutoExit(exit bool) {
 	autoExit = exit
 }
 
-// New creates a new window.
+// New creates a new acme window using the default connection.
 func New() (*Win, error) {
-	fsysOnce.Do(mountAcme)
-	if fsysErr != nil {
-		return nil, fsysErr
-	}
-	fid, err := fsys.Open("new/ctl", plan9.ORDWR)
+	f, err := defaultFS()
 	if err != nil {
 		return nil, err
 	}
-	buf := make([]byte, 100)
-	n, err := fid.Read(buf)
-	if err != nil {
-		fid.Close()
-		return nil, err
-	}
-	a := strings.Fields(string(buf[0:n]))
-	if len(a) == 0 {
-		fid.Close()
-		return nil, errors.New("short read from acme/new/ctl")
-	}
-	id, err := strconv.Atoi(a[0])
-	if err != nil {
-		fid.Close()
-		return nil, errors.New("invalid window id in acme/new/ctl: " + a[0])
-	}
-	return Open(id, fid)
+	return f.New()
 }
 
 type WinInfo struct {
@@ -162,59 +257,22 @@ func (r *LogReader) Read() (LogEvent, error) {
 	return LogEvent{id, op, name}, nil
 }
 
-// Log returns a reader reading the acme/log file.
+// Log returns a reader for the acme log file using the default connection.
 func Log() (*LogReader, error) {
-	fsysOnce.Do(mountAcme)
-	if fsysErr != nil {
-		return nil, fsysErr
-	}
-	f, err := fsys.Open("log", plan9.OREAD)
+	f, err := defaultFS()
 	if err != nil {
 		return nil, err
 	}
-	return &LogReader{f: f}, nil
+	return f.Log()
 }
 
-// Windows returns a list of the existing acme windows.
+// Windows returns a list of the existing acme windows using the default connection.
 func Windows() ([]WinInfo, error) {
-	fsysOnce.Do(mountAcme)
-	if fsysErr != nil {
-		return nil, fsysErr
-	}
-	index, err := fsys.Open("index", plan9.OREAD)
+	f, err := defaultFS()
 	if err != nil {
 		return nil, err
 	}
-	defer index.Close()
-	data, err := ioutil.ReadAll(index)
-	if err != nil {
-		return nil, err
-	}
-	var infos []WinInfo
-	for _, line := range strings.Split(string(data), "\n") {
-		if len(line) == 0 {
-			continue
-		}
-		var info WinInfo
-		tag, err := splitFields(line,
-			&info.ID,
-			&info.TagLen,
-			&info.BodyLen,
-			&info.IsDir,
-			&info.IsModified,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("invalid index line %q: %v", line, err)
-		}
-		i := strings.Index(tag, " Del Snarf ")
-		if i == -1 {
-			return nil, fmt.Errorf("cannot determine filename in tag %q", tag)
-		}
-		info.Name = tag[:i]
-		info.Tag = tag[i:]
-		infos = append(infos, info)
-	}
-	return infos, nil
+	return f.Windows()
 }
 
 // Show looks and causes acme to show the window with the given name,
@@ -238,34 +296,14 @@ func Show(name string) *Win {
 	return nil
 }
 
-// Open connects to the existing window with the given id.
-// If ctl is non-nil, Open uses it as the window's control file
-// and takes ownership of it.
+// Open connects to the existing window with the given id using the default connection.
+// If ctl is non-nil it is used as the window's control file (ownership transferred).
 func Open(id int, ctl *client.Fid) (*Win, error) {
-	fsysOnce.Do(mountAcme)
-	if fsysErr != nil {
-		return nil, fsysErr
+	f, err := defaultFS()
+	if err != nil {
+		return nil, err
 	}
-	if ctl == nil {
-		var err error
-		ctl, err = fsys.Open(fmt.Sprintf("%d/ctl", id), plan9.ORDWR)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	w := new(Win)
-	w.id = id
-	w.ctl = ctl
-	w.next = nil
-	w.prev = last
-	if last != nil {
-		last.next = w
-	} else {
-		windows = w
-	}
-	last = w
-	return w, nil
+	return f.Open(id, ctl)
 }
 
 // Addr writes format, ... to the window's addr file.
@@ -278,11 +316,7 @@ func (w *Win) Addr(format string, args ...interface{}) error {
 // Unlike other file accessors, a fresh fid is opened on each call because
 // acme flushes the style only at close (clunk).
 func (w *Win) Style(data []byte) error {
-	fsysOnce.Do(mountAcme)
-	if fsysErr != nil {
-		return fsysErr
-	}
-	fid, err := fsys.Open(fmt.Sprintf("%d/style", w.id), plan9.OWRITE)
+	fid, err := w.fs.Open(fmt.Sprintf("%d/style", w.id), plan9.OWRITE)
 	if err != nil {
 		return err
 	}
@@ -439,7 +473,7 @@ func (w *Win) fid(name string) (*client.Fid, error) {
 	}
 	if *f == nil {
 		var err error
-		*f, err = fsys.Open(fmt.Sprintf("%d/%s", w.id, name), mode)
+		*f, err = w.fs.Open(fmt.Sprintf("%d/%s", w.id, name), mode)
 		if err != nil {
 			return nil, err
 		}
